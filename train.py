@@ -1,9 +1,9 @@
 """
-Akkadian → English Machine Translation
-Steps 4, 5, 6: Data Prep → Fine-tune → BLEU Evaluation + Submission
+Rosales, Kean Louis R. 
+Ranigo, Gerome
+Cipriaso, James
 
-Model: Helsinki-NLP/opus-mt-mul-en  (multilingual → English, fast to fine-tune)
-Swap MODEL_NAME for "t5-small" or "facebook/nllb-200-distilled-600M" if you want.
+Akkadian Translation
 """
 
 import os
@@ -28,16 +28,14 @@ import evaluate
 DATA_DIR   = Path("deep-past-initiative-machine-translation")
 OUTPUT_DIR = Path("outputs/akkadian-mt")
 
-MODEL_NAME  = "Helsinki-NLP/opus-mt-mul-en"   # swap freely
+MODEL_NAME  = "Helsinki-NLP/opus-mt-mul-en" 
 MAX_SRC_LEN = 512
 MAX_TGT_LEN = 512
 BATCH_SIZE  = 8
-GRAD_ACC    = 2          # effective batch = 16
+GRAD_ACC    = 2          
 EPOCHS      = 5
 LR          = 5e-5
 SEED        = 42
-
-# ── Step 4 · Load & Prepare Data ─────────────────────────────────────────────
 
 def load_data():
     df = pd.read_csv(DATA_DIR / "train.csv")
@@ -66,22 +64,13 @@ def load_data():
 
 def tokenize_dataset(dataset, tokenizer):
     def preprocess(examples):
-        # Tokenize source (Akkadian transliteration)
         model_inputs = tokenizer(
             examples["src"],
+            text_target=examples["tgt"],  
             max_length=MAX_SRC_LEN,
             truncation=True,
             padding=False,
         )
-        # Tokenize target (English translation)
-        with tokenizer.as_target_tokenizer():
-            labels = tokenizer(
-                examples["tgt"],
-                max_length=MAX_TGT_LEN,
-                truncation=True,
-                padding=False,
-            )
-        model_inputs["labels"] = labels["input_ids"]
         return model_inputs
 
     tokenized = dataset.map(
@@ -91,9 +80,13 @@ def tokenize_dataset(dataset, tokenizer):
         desc="Tokenizing",
     )
     return tokenized
-
-
-# ── Step 5 · Fine-tune with Seq2SeqTrainer ────────────────────────────────────
+    tokenized = dataset.map(
+        preprocess,
+        batched=True,
+        remove_columns=["src", "tgt"],
+        desc="Tokenizing",
+    )
+    return tokenized
 
 def train(tokenized_ds, tokenizer, model):
     data_collator = DataCollatorForSeq2Seq(
@@ -107,19 +100,19 @@ def train(tokenized_ds, tokenizer, model):
         per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACC,
         learning_rate=LR,
-        warmup_ratio=0.05,
+        warmup_steps=20,
         weight_decay=0.01,
-        predict_with_generate=True,   # needed for BLEU-based eval
+        predict_with_generate=True,  
         generation_max_length=MAX_TGT_LEN,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="bleu",
         greater_is_better=True,
         logging_steps=50,
-        fp16=torch.cuda.is_available(),   # use AMP if GPU is available
+        fp16=torch.cuda.is_available(),   
         seed=SEED,
-        report_to="none",               # change to "wandb" if you use W&B
+        report_to="none",               
     )
 
     trainer = Seq2SeqTrainer(
@@ -127,21 +120,18 @@ def train(tokenized_ds, tokenizer, model):
         args=training_args,
         train_dataset=tokenized_ds["train"],
         eval_dataset=tokenized_ds["validation"],
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=make_compute_metrics(tokenizer),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
 
-    print("\n🚀 Starting training …")
+    print("\nStarting training …")
     trainer.train()
-    print(f"\n✅ Training complete. Best model saved to: {OUTPUT_DIR}/best")
+    print(f"\nTraining complete. Best model saved to: {OUTPUT_DIR}/best")
     trainer.save_model(str(OUTPUT_DIR / "best"))
     tokenizer.save_pretrained(str(OUTPUT_DIR / "best"))
     return trainer
-
-
-# ── Step 6 · BLEU Evaluation ─────────────────────────────────────────────────
 
 def make_compute_metrics(tokenizer):
     bleu_metric = evaluate.load("sacrebleu")
@@ -149,13 +139,11 @@ def make_compute_metrics(tokenizer):
     def compute_metrics(eval_preds):
         preds, labels = eval_preds
 
-        # Replace -100 (padding) in labels with pad_token_id
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
 
         decoded_preds  = tokenizer.batch_decode(preds,   skip_special_tokens=True)
         decoded_labels = tokenizer.batch_decode(labels,  skip_special_tokens=True)
 
-        # sacrebleu expects list-of-lists for references
         result = bleu_metric.compute(
             predictions=decoded_preds,
             references=[[ref] for ref in decoded_labels],
@@ -163,9 +151,6 @@ def make_compute_metrics(tokenizer):
         return {"bleu": result["score"]}
 
     return compute_metrics
-
-
-# ── Submission Generation ─────────────────────────────────────────────────────
 
 def generate_submission(tokenizer, model):
     test_df = pd.read_csv(DATA_DIR / "test.csv")
@@ -199,33 +184,25 @@ def generate_submission(tokenizer, model):
         "translation": translations,
     })
     submission.to_csv("submission.csv", index=False)
-    print("📄 submission.csv written.")
+    print("submission.csv written.")
     return submission
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load tokenizer & base model
     print(f"Loading tokenizer and model: {MODEL_NAME}")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model     = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-    # Steps 4 → tokenize
     raw_ds      = load_data()
     tokenized_ds = tokenize_dataset(raw_ds, tokenizer)
 
-    # Step 5 → fine-tune
     trainer = train(tokenized_ds, tokenizer, model)
 
-    # Step 6 → evaluate on validation set and print final BLEU
-    print("\n📊 Final evaluation on validation set:")
+    print("\nFinal evaluation on validation set:")
     metrics = trainer.evaluate()
     print(metrics)
 
-    # Generate submission
     best_model = AutoModelForSeq2SeqLM.from_pretrained(str(OUTPUT_DIR / "best"))
     generate_submission(tokenizer, best_model)
 
